@@ -1,26 +1,67 @@
-# Verificar DNS del NIC
-$nic = (Get-NetAdapter | Where-Object {$_.Status -eq "Up"} | Select-Object -First 1 -Expand Name)
-Set-DnsClientServerAddress -InterfaceAlias $nic -ServerAddresses "150.1.7.200"
+# ==== Post-AD Install for cisco.com (WS2012/2012 R2/2016+) ====
+$ErrorActionPreference = 'Stop'
 
-# Forwarders
-Remove-DnsServerForwarder -PassThru -ErrorAction SilentlyContinue | Out-Null
-Add-DnsServerForwarder -IPAddress @("1.1.1.1","8.8.8.8")
+# --- Detect NIC alias de forma confiable ---
+Import-Module NetTCPIP -ErrorAction SilentlyContinue
+$nic = (Get-NetIPConfiguration | Where-Object {
+    $_.IPv4Address -and $_.NetAdapter.Status -eq 'Up'
+} | Select-Object -First 1).InterfaceAlias
 
-# Zona reversa (PTR)
-if (-not (Get-DnsServerZone | Where-Object {$_.ZoneName -like "*.in-addr.arpa"})) {
-    Add-DnsServerPrimaryZone -NetworkId "150.1.7.0/24" -DynamicUpdate Secure
+if (-not $nic) {
+    Write-Host "No pude detectar el NIC automáticamente. Mostrando interfaces..." -ForegroundColor Yellow
+    Get-NetIPConfiguration | ft InterfaceAlias,IPv4Address,IPv4DefaultGateway -AutoSize
+    throw "Define manualmente: `$nic = 'Ethernet'  (o el nombre que corresponda)"
 }
 
-# Registros A útiles
-$Domain = "cisco.com"
-Add-DnsServerResourceRecordA -Name "dc1"   -ZoneName $Domain -IPv4Address "150.1.7.200" -CreatePtr
-Add-DnsServerResourceRecordA -Name "www"   -ZoneName $Domain -IPv4Address "150.1.7.20"
-Add-DnsServerResourceRecordA -Name "files" -ZoneName $Domain -IPv4Address "150.1.7.30"
+# --- Setear DNS del NIC al DC local + alterno ---
+$dcIP = "150.1.7.200"
+Set-DnsClientServerAddress -InterfaceAlias $nic -ServerAddresses $dcIP,"1.1.1.1"
 
-# OU + usuario de prueba
-Import-Module ActiveDirectory
-New-ADOrganizationalUnit -Name "Lab" -Path "DC=cisco,DC=com" -ProtectedFromAccidentalDeletion $false
-$UserPwd = ConvertTo-SecureString "P@ssw0rd123!" -AsPlainText -Force
-New-ADUser -Name "lab.user" -SamAccountName "lab.user" -AccountPassword $UserPwd -Enabled $true -Path "OU=Lab,DC=cisco,DC=com"
+# --- Cargar módulo DNS Server (ya debería estar por el rol) ---
+Import-Module DnsServer -ErrorAction SilentlyContinue
 
+# --- Forwarders: limpiar existentes y agregar nuevos (sin prompts) ---
+$fw = Get-DnsServerForwarder -ErrorAction SilentlyContinue
+if ($fw -and $fw.IPAddress) {
+    foreach ($ip in $fw.IPAddress) { Remove-DnsServerForwarder -IPAddress $ip -Force }
+}
+Add-DnsServerForwarder -IPAddress 1.1.1.1,8.8.8.8
+
+# --- Zona reversa PTR (150.1.7.0/24). Crear solo si no existe ---
+$revNet = "150.1.7.0/24"
+$revExists = (Get-DnsServerZone | Where-Object {$_.ZoneName -like "*.in-addr.arpa"})
+if (-not $revExists) {
+    Add-DnsServerPrimaryZone -NetworkId $revNet -DynamicUpdate Secure
+}
+
+# --- Registros A (y PTR para dc1) en cisco.com ---
+$zone = "cisco.com"
+if (-not (Get-DnsServerResourceRecord -ZoneName $zone -RRType A -Name "dc1" -ErrorAction SilentlyContinue)) {
+    Add-DnsServerResourceRecordA -Name "dc1"   -ZoneName $zone -IPv4Address $dcIP -CreatePtr
+}
+if (-not (Get-DnsServerResourceRecord -ZoneName $zone -RRType A -Name "www" -ErrorAction SilentlyContinue)) {
+    Add-DnsServerResourceRecordA -Name "www"   -ZoneName $zone -IPv4Address "150.1.7.20"
+}
+if (-not (Get-DnsServerResourceRecord -ZoneName $zone -RRType A -Name "files" -ErrorAction SilentlyContinue)) {
+    Add-DnsServerResourceRecordA -Name "files" -ZoneName $zone -IPv4Address "150.1.7.30"
+}
+
+# --- OU y usuario de prueba ---
+Import-Module ActiveDirectory -ErrorAction SilentlyContinue
+if (-not (Get-ADOrganizationalUnit -LDAPFilter '(ou=Lab)' -SearchBase "DC=cisco,DC=com" -ErrorAction SilentlyContinue)) {
+    New-ADOrganizationalUnit -Name "Lab" -Path "DC=cisco,DC=com" -ProtectedFromAccidentalDeletion $false
+}
+if (-not (Get-ADUser -Filter "SamAccountName -eq 'lab.user'" -ErrorAction SilentlyContinue)) {
+    $UserPwd = ConvertTo-SecureString "P@ssw0rd123!" -AsPlainText -Force
+    New-ADUser -Name "lab.user" -SamAccountName "lab.user" -AccountPassword $UserPwd -Enabled $true -Path "OU=Lab,DC=cisco,DC=com"
+}
+
+# --- Habilitar administración remota (por si hace falta) ---
 Enable-PSRemoting -Force
+
+# --- Verificaciones rápidas ---
+Write-Host "`n=== Verificación rápida ===" -ForegroundColor Cyan
+ipconfig /all | Out-Host
+Resolve-DnsName dc1.cisco.com | Out-Host
+Resolve-DnsName microsoft.com | Out-Host
+Write-Host "Post-Install completado OK." -ForegroundColor Green
